@@ -1,3 +1,4 @@
+use futures::StreamExt;
 use kv_entity::DB;
 use kv_entity::Error;
 
@@ -21,24 +22,40 @@ pub struct UserExtend {
     pub extend: ::prost::alloc::string::String,
 }
 
+#[derive(kv_entity::KvRelation)]
+#[derive(kv_entity::KvComponent, Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FriendRelation {
+    #[prost(int32, tag = "1")]
+    pub favorability: i32,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     env_logger::Builder::from_default_env()
         .filter_module("mini", log::LevelFilter::Debug)
+        .filter_module("kv_entity", log::LevelFilter::Debug)
         .init();
 
     let db = DB::new(vec!["172.20.8.107:2379".to_string()]).await?;
 
+    for i in 0..10 {
+        let uid = uuid::Uuid::new_v4().to_string();
+        db.entity(&uid)
+            .attach(UserInfo {
+                name: "Bob".to_string(),
+                age: i,
+                email: "bob@example.com".to_string(),
+            })
+            .await?;
+    }
+
+    let mut iterator = db.iterator::<UserInfo>();
+    while let Some(Ok((entity_id, data))) = iterator.next().await {
+        log::info!("entity_id = {:?}, data = {:?}", entity_id, data);
+        db.entity(&entity_id).delete().await?;
+    }
+
     let uid = uuid::Uuid::new_v4().to_string();
-
-    db.entity(&uid)
-        .attach(UserInfo {
-            name: "Bob".to_string(),
-            age: 21,
-            email: "bob@example.com".to_string(),
-        })
-        .await?;
-
     db.entity(&uid)
         .attach((
             UserInfo {
@@ -52,9 +69,6 @@ async fn main() -> Result<(), Error> {
         ))
         .await?;
     log::info!("attach entity {} success", uid);
-
-    let data = db.iterator::<UserInfo>().await?;
-    log::info!("data = {:?}", data);
 
     let a = db.query::<UserInfo>().name("Alice").single().await?;
     log::info!("a = {:?}", a);

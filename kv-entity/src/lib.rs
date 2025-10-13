@@ -7,7 +7,7 @@ mod meta;
 pub use db::DB;
 pub use error::Error;
 pub use filter::{BoundCondition, Filter};
-pub use kv_entity_derive::KvComponent;
+pub use kv_entity_derive::{KvComponent, KvRelation};
 
 // 定义组件元信息
 pub struct ComponentMeta {
@@ -53,6 +53,11 @@ pub trait KvComponent {
     fn indexed_field_names() -> Vec<&'static str>;
 }
 
+pub trait KvRelation {
+    /// 返回类型的完整路径，用作 KV 存储的前缀
+    fn type_path() -> &'static str;
+}
+
 pub(crate) fn component_data_path(type_path: &str, entity_id: &str) -> String {
     format!("component/single/{}/{}", type_path, entity_id)
 }
@@ -71,4 +76,12 @@ pub(crate) fn component_index_path(
         "component/index/{}/{}/{}/{}",
         type_path, field_name, value, entity_id
     )
+}
+
+pub(crate) fn relation_in_path(type_path: &str, from: &str, to: &str) -> String {
+    format!("relation/in/{}/{}/{}", type_path, from, to)
+}
+
+pub(crate) fn relation_out_path(type_path: &str, from: &str, to: &str) -> String {
+    format!("relation/out/{}/{}/{}", type_path, from, to)
 }

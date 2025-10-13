@@ -5,6 +5,7 @@ edition.workspace = true
 authors.workspace = true
 
 [dependencies]
+async-stream = "0.3.6"
 futures = "0.3.31"
 inventory = "0.3.21"
 kv-entity-derive = { path = "../kv-entity-derive" }

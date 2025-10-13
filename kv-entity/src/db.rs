@@ -1,12 +1,15 @@
+use async_stream::try_stream;
+use futures::Stream;
 use prost::Message;
-use tikv_client::{TransactionClient, proto::kvrpcpb};
+use tikv_client::{Key, TransactionClient, proto::kvrpcpb};
 
 use crate::{
-    KvComponent,
+    KvComponent, KvRelation,
     bundle::ComponentBundle,
     component_data_path, component_index_path, entity_metadata_path,
     error::Error,
     meta::{ComponentArchetype, EntityMetadata},
+    relation_in_path, relation_out_path,
 };
 
 #[derive(Clone)]
@@ -48,42 +51,46 @@ impl DB {
         T::query(self.clone())
     }
 
-    pub async fn iterator<T: KvComponent + prost::Message + Default>(
+    pub fn iterator<T: KvComponent + prost::Message + Default + 'static>(
         &self,
-    ) -> Result<Vec<(String, T)>, Error> {
-        let mut snapshot = self.client.snapshot(
-            self.client
-                .current_timestamp()
-                .await
-                .map_err(Error::TikvError)?,
-            tikv_client::TransactionOptions::new_optimistic(),
-        );
+    ) -> std::pin::Pin<Box<dyn Stream<Item = Result<(String, T), Error>> + '_>> {
+        const PAGE_SIZE: usize = 128;
+        Box::pin(try_stream! {
+            let mut snapshot = self.client.snapshot(
+                self.client
+                    .current_timestamp()
+                    .await
+                    .map_err(Error::TikvError)?,
+                tikv_client::TransactionOptions::new_optimistic(),
+            );
 
-        let mut data = Vec::new();
-
-        let start_key = component_data_path(T::type_path(), "");
-        let end_key = component_data_path(T::type_path(), "~");
-        for kv in snapshot
-            .scan(start_key.clone()..end_key.clone().into(), 100)
-            .await
-            .map_err(Error::TikvError)?
-        {
-            let key = String::from_utf8(Into::<Vec<u8>>::into(kv.key().clone()))
-                .map_err(Error::InvalidUtf8)?
-                .split('/')
-                .nth(3)
-                .ok_or(Error::NotFound)?
-                .to_string();
-            let Some(entity_id) = key.strip_prefix("e-") else {
-                continue;
-            };
-            data.push((
-                entity_id.to_string(),
-                T::decode(kv.value().as_slice()).map_err(Error::DeserializationError)?,
-            ));
-        }
-
-        Ok(data)
+            let mut start_key: Key = component_data_path(T::type_path(), "").into();
+            let end_key: Key = component_data_path(T::type_path(), "~").into();
+            loop {
+                let kvs = snapshot
+                    .scan(start_key.clone()..end_key.clone(), PAGE_SIZE as u32)
+                    .await
+                    .map_err(Error::TikvError)?.collect::<Vec<_>>();
+                start_key = next_key(&kvs.last().ok_or(Error::NotFound)?.key().clone());
+                let len = kvs.len();
+                for kv in kvs {
+                    let key = String::from_utf8(Into::<Vec<u8>>::into(kv.key().clone()))
+                        .map_err(Error::InvalidUtf8)?
+                        .split('/')
+                        .nth(3)
+                        .ok_or(Error::NotFound)?
+                        .to_string();
+                    let Some(entity_id) = key.strip_prefix("e-") else {
+                        continue;
+                    };
+                    let value = T::decode(kv.value().as_slice()).map_err(Error::DeserializationError)?;
+                    yield (entity_id.to_string(), value);
+                }
+                if len < PAGE_SIZE {
+                    break;
+                }
+            }
+        })
     }
 }
 
@@ -211,6 +218,116 @@ impl EntityHandler {
         Ok(EntityMetadata::decode(metadata.as_slice()).map_err(Error::DeserializationError)?)
     }
 
+    pub async fn link<T: KvRelation + prost::Message + Default>(
+        &self,
+        entity_id: impl Into<String>,
+        value: T,
+    ) -> Result<Self, Error> {
+        let entity_id = entity_id.into();
+
+        let mutations = vec![
+            kvrpcpb::Mutation {
+                key: relation_in_path(T::type_path(), &self.entity_id, &entity_id).into(),
+                op: kvrpcpb::Op::Put.into(),
+                value: value.encode_to_vec(),
+                ..Default::default()
+            },
+            kvrpcpb::Mutation {
+                key: relation_out_path(T::type_path(), &entity_id, &self.entity_id).into(),
+                op: kvrpcpb::Op::Put.into(),
+                value: [].into(),
+                ..Default::default()
+            },
+        ];
+
+        let mut txn = self
+            .client
+            .begin_optimistic()
+            .await
+            .map_err(Error::TikvError)?;
+
+        txn.batch_mutate(mutations)
+            .await
+            .map_err(Error::TikvError)?;
+
+        txn.commit().await.map_err(Error::TikvError)?;
+        Ok(self.clone())
+    }
+
+    pub async fn unlink<T: KvRelation + prost::Message + Default>(
+        &self,
+        entity_id: impl Into<String>,
+    ) -> Result<Self, Error> {
+        let entity_id = entity_id.into();
+
+        let mutations = vec![
+            kvrpcpb::Mutation {
+                key: relation_in_path(T::type_path(), &self.entity_id, &entity_id).into(),
+                op: kvrpcpb::Op::Del.into(),
+                ..Default::default()
+            },
+            kvrpcpb::Mutation {
+                key: relation_out_path(T::type_path(), &entity_id, &self.entity_id).into(),
+                op: kvrpcpb::Op::Del.into(),
+                ..Default::default()
+            },
+        ];
+
+        let mut txn = self
+            .client
+            .begin_optimistic()
+            .await
+            .map_err(Error::TikvError)?;
+
+        txn.batch_mutate(mutations)
+            .await
+            .map_err(Error::TikvError)?;
+
+        txn.commit().await.map_err(Error::TikvError)?;
+        Ok(self.clone())
+    }
+
+    pub async fn incoming<T: KvRelation + prost::Message + Default>(
+        &self,
+    ) -> Result<Vec<(String, T)>, Error> {
+        const PAGE_SIZE: usize = 128;
+        let mut snapshot = self.client.snapshot(
+            self.client
+                .current_timestamp()
+                .await
+                .map_err(Error::TikvError)?,
+            tikv_client::TransactionOptions::new_optimistic(),
+        );
+        let mut start_key: Key = relation_in_path(T::type_path(), &self.entity_id, "").into();
+        let end_key: Key = relation_in_path(T::type_path(), &self.entity_id, "~").into();
+        let mut result = Vec::new();
+        loop {
+            let kvs = snapshot
+                .scan(start_key.clone()..end_key.clone(), PAGE_SIZE as u32)
+                .await
+                .map_err(Error::TikvError)?
+                .collect::<Vec<_>>();
+            start_key = next_key(&kvs.last().ok_or(Error::NotFound)?.key().clone());
+            let len = kvs.len();
+
+            for kv in kvs {
+                let entity_id = String::from_utf8(Into::<Vec<u8>>::into(kv.key().clone()))
+                    .map_err(Error::InvalidUtf8)?
+                    .split('/')
+                    .nth(4)
+                    .ok_or(Error::NotFound)?
+                    .to_string();
+                let value =
+                    T::decode(kv.value().as_slice()).map_err(Error::DeserializationError)?;
+                result.push((entity_id, value));
+            }
+            if len < PAGE_SIZE {
+                break;
+            }
+        }
+        Ok(result)
+    }
+
     pub(super) async fn get_metadata(
         &self,
         txn: &mut tikv_client::Transaction,
@@ -311,4 +428,15 @@ impl EntityHandler {
 
         Ok(())
     }
+}
+
+fn next_key(key: &Key) -> Key {
+    let mut next_key = Into::<Vec<u8>>::into(key.clone());
+    for i in (0..next_key.len()).rev() {
+        if next_key[i] < 0xff {
+            next_key[i] += 1;
+            return Key::from(next_key);
+        }
+    }
+    Key::from(next_key)
 }

@@ -176,6 +176,23 @@ pub fn derive_kv_components(input: TokenStream) -> TokenStream {
     TokenStream::from(expanded)
 }
 
+
+#[proc_macro_derive(KvRelation)]
+pub fn derive_kv_relation(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    let struct_name = &input.ident;
+    
+    let expanded = quote! {
+        impl kv_entity::KvRelation for #struct_name {
+            fn type_path() -> &'static str {
+                concat!(module_path!(), "::", stringify!(#struct_name))
+            }
+        }
+    };
+
+    TokenStream::from(expanded)
+}
+
 // 生成数字类型的编码逻辑
 fn generate_numeric_encoding(type_str: &str) -> proc_macro2::TokenStream {
     match type_str {
