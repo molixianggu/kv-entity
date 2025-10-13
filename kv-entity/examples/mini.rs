@@ -23,25 +23,41 @@ pub struct UserExtend {
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
+    env_logger::Builder::from_default_env()
+        .filter_module("mini", log::LevelFilter::Debug)
+        .init();
+
     let db = DB::new(vec!["172.20.8.107:2379".to_string()]).await?;
 
-    db.drop_all().await?;
+    let uid = uuid::Uuid::new_v4().to_string();
 
-    db.entity("1")
-        .await
+    db.entity(&uid)
         .attach(UserInfo {
-            name: "Alice".to_string(),
-            age: 25,
-            email: "alice@example.com".to_string(),
-        })
-        .await?
-        .attach(UserExtend {
-            extend: "extend".to_string(),
+            name: "Bob".to_string(),
+            age: 21,
+            email: "bob@example.com".to_string(),
         })
         .await?;
 
+    db.entity(&uid)
+        .attach((
+            UserInfo {
+                name: "Alice".to_string(),
+                age: 25,
+                email: "alice@example.com".to_string(),
+            },
+            UserExtend {
+                extend: "extend".to_string(),
+            },
+        ))
+        .await?;
+    log::info!("attach entity {} success", uid);
+
+    let data = db.iterator::<UserInfo>().await?;
+    log::info!("data = {:?}", data);
+
     let a = db.query::<UserInfo>().name("Alice").single().await?;
-    println!("{:?}", a);
+    log::info!("a = {:?}", a);
 
     let b = db
         .query::<UserInfo>()
@@ -51,9 +67,13 @@ async fn main() -> Result<(), Error> {
         .get::<UserExtend>()
         .await?
         .unwrap();
-    println!("{:?}", b);
+    log::info!("b = {:?}", b);
 
-    db.entity("1").await.delete().await?;
+    db.entity(&uid).delete().await?;
+
+    log::info!("delete entity {} success", uid);
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     Ok(())
 }

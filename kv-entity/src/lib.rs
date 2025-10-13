@@ -1,10 +1,12 @@
+mod bundle;
 mod db;
 mod error;
 mod filter;
+mod meta;
 
 pub use db::DB;
 pub use error::Error;
-pub use filter::Filter;
+pub use filter::{BoundCondition, Filter};
 pub use kv_entity_derive::KvComponent;
 
 // 定义组件元信息
@@ -49,4 +51,24 @@ pub trait KvComponent {
 
     /// 返回索引字段名
     fn indexed_field_names() -> Vec<&'static str>;
+}
+
+pub(crate) fn component_data_path(type_path: &str, entity_id: &str) -> String {
+    format!("component/single/{}/{}", type_path, entity_id)
+}
+
+pub(crate) fn entity_metadata_path(entity_id: &str) -> String {
+    format!("entity/metadata/{}", entity_id)
+}
+
+pub(crate) fn component_index_path(
+    type_path: &str,
+    field_name: &str,
+    value: &str,
+    entity_id: &str,
+) -> String {
+    format!(
+        "component/index/{}/{}/{}/{}",
+        type_path, field_name, value, entity_id
+    )
 }

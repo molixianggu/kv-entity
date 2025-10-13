@@ -1,13 +1,18 @@
 use std::marker::PhantomData;
 
-use crate::{DB, KvComponent, db::EntityHandler, error::Error};
+use crate::{
+    DB, KvComponent, component_data_path, component_index_path, db::EntityHandler, error::Error,
+};
+
+pub enum BoundCondition {
+    Value(String),
+    Range(String, String),
+}
 
 pub struct Filter<T> {
     client: DB,
     field_name: String,
-    start: Option<String>,
-    end: Option<String>,
-    value: Option<String>,
+    bound_condition: BoundCondition,
     _marker: PhantomData<T>,
 }
 
@@ -15,114 +20,33 @@ impl<T> Filter<T>
 where
     T: KvComponent + prost::Message + Default,
 {
-    pub fn new(
-        client: DB,
-        field_name: String,
-        start: Option<String>,
-        end: Option<String>,
-        value: Option<String>,
-    ) -> Self {
+    pub fn new(client: DB, field_name: String, bound_condition: BoundCondition) -> Self {
         Self {
             client,
             field_name,
-            start,
-            end,
-            value,
+            bound_condition,
             _marker: PhantomData,
         }
     }
 
     async fn query_entity_id(&self, snapshot: &mut tikv_client::Snapshot) -> Result<String, Error> {
-        if let Some(value) = &self.value {
-            // 单值查询
-            let Some(entity_id) = snapshot
-                .get(format!(
-                    "index/component/{}/{}/{}",
-                    T::type_path(),
-                    self.field_name,
-                    value
-                ))
-                .await
-                .map_err(Error::TikvError)?
-            else {
-                return Err(Error::NotFound);
-            };
-            return Ok(
-                String::from_utf8(entity_id).map_err(|e| Error::InvalidEntityId(e.to_string()))?
-            );
-        } else if let (Some(start), Some(end)) = (&self.start, &self.end) {
-            // 范围查询
-            let Some(kv) = snapshot
-                .scan(
-                    format!(
-                        "index/component/{}/{}/{}",
-                        T::type_path(),
-                        self.field_name,
-                        start
-                    )
-                        ..format!(
-                            "index/component/{}/{}/{}",
-                            T::type_path(),
-                            self.field_name,
-                            end
-                        )
-                        .into(),
-                    1,
-                )
-                .await
-                .map_err(Error::TikvError)?
-                .next()
-            else {
-                return Err(Error::NotFound);
-            };
-            return Ok(
-                // 转换为字符串
-                String::from_utf8(kv.value().to_vec())
-                    .map_err(|e| Error::InvalidEntityId(e.to_string()))?,
-            );
-        } else if let (Some(start), None) = (&self.start, &self.end) {
-            // 大于查询
-            let Some(kv) = snapshot
-                .scan(
-                    format!(
-                        "index/component/{}/{}/{}",
-                        T::type_path(),
-                        self.field_name,
-                        start
-                    )..,
-                    1,
-                )
-                .await
-                .map_err(Error::TikvError)?
-                .next()
-            else {
-                return Err(Error::NotFound);
-            };
-            return Ok(String::from_utf8(kv.value().to_vec())
-                .map_err(|e| Error::InvalidEntityId(e.to_string()))?);
-        } else if let (None, Some(end)) = (&self.start, &self.end) {
-            // 小于查询
-            let Some(kv) = snapshot
-                .scan(
-                    ..format!(
-                        "index/component/{}/{}/{}",
-                        T::type_path(),
-                        self.field_name,
-                        end
-                    ),
-                    1,
-                )
-                .await
-                .map_err(Error::TikvError)?
-                .next()
-            else {
-                return Err(Error::NotFound);
-            };
-            return Ok(String::from_utf8(kv.value().to_vec())
-                .map_err(|e| Error::InvalidEntityId(e.to_string()))?);
-        } else {
-            return Err(Error::InvalidEntityId("Invalid entity id".to_string()));
-        }
+        let (start, end) = match &self.bound_condition {
+            BoundCondition::Value(value) => (value, value),
+            BoundCondition::Range(start, end) => (start, end),
+        };
+
+        let start_key = component_index_path(T::type_path(), &self.field_name, start, "");
+        let end_key = component_index_path(T::type_path(), &self.field_name, end, "~");
+        let Some(kv) = snapshot
+            .scan(start_key..end_key.into(), 1)
+            .await
+            .map_err(Error::TikvError)?
+            .next()
+        else {
+            return Err(Error::NotFound);
+        };
+        return Ok(String::from_utf8(kv.value().to_vec())
+            .map_err(|e| Error::InvalidEntityId(e.to_string()))?);
     }
 
     pub async fn entity(&self) -> Result<EntityHandler, Error> {
@@ -152,7 +76,7 @@ where
         );
         let entity_id = self.query_entity_id(&mut snapshot).await?;
         let Some(data) = snapshot
-            .get(format!("component/single/{}/{}", entity_id, T::type_path()))
+            .get(component_data_path(T::type_path(), &entity_id))
             .await
             .map_err(Error::TikvError)?
         else {

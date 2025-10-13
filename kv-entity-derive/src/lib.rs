@@ -79,23 +79,20 @@ pub fn derive_kv_components(input: TokenStream) -> TokenStream {
         let field_name_str = field_name.to_string();
         
         if is_string_type {
-            // 字符串类型，接受 impl Into<String>
             quote! {
                 pub fn #method_name(&mut self, value: impl Into<String>) -> kv_entity::Filter<#struct_name> {
                     let encoded = #struct_name::#encode_fn_name(value);
-                    kv_entity::Filter::new(self.client.clone(), #field_name_str.to_string(), None, None, Some(encoded))
+                    kv_entity::Filter::new(self.client.clone(), #field_name_str.to_string(), kv_entity::BoundCondition::Value(encoded))
                 }
             }
         } else if is_numeric_type {
-            // 数字类型 - 调用对应的编码函数
             quote! {
                 pub fn #method_name(&mut self, value: #field_type) -> kv_entity::Filter<#struct_name> {
                     let encoded = #struct_name::#encode_fn_name(value);
-                    kv_entity::Filter::new(self.client.clone(), #field_name_str.to_string(), None, None, Some(encoded))
+                    kv_entity::Filter::new(self.client.clone(), #field_name_str.to_string(), kv_entity::BoundCondition::Value(encoded))
                 }
             }
         } else {
-            // 其他类型不支持索引，产生编译错误
             let error_msg = format!(
                 "Field '{}' has type '{}' which is not supported for indexing. Only String and numeric types are supported.",
                 field_name, quote!(#field_type)
