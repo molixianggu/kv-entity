@@ -1,0 +1,15 @@
+[package]
+name = "kv-entity"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+inventory = "0.3.21"
+kv-entity-derive = { path = "../kv-entity-derive" }
+prost = "0.14.1"
+thiserror = "2.0.17"
+tikv-client = "0.3.0"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
