@@ -108,8 +108,7 @@ impl DB {
             let len = kvs.len();
             for kv in kvs {
                 let key = key_to_string(&kv)?;
-                log::info!("删除: {}", key);
-                tnx.delete(kv).await.map_err(Error::TikvError)?;
+                log::info!("{}", key);
             }
             if len < PAGE_SIZE {
                 break;
