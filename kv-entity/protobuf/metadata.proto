@@ -8,7 +8,3 @@ message ComponentArchetype { map<string, string> index_keys = 1; }
 message EntityMetadata {
   map<string, ComponentArchetype> component_archetypes = 1;
 }
-
-message RelationIndex {
-  repeated string edge = 1;
-}

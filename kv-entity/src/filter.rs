@@ -1,7 +1,8 @@
 use std::marker::PhantomData;
 
 use crate::{
-    DB, KvComponent, component_data_path, component_index_path, db::EntityHandler, error::Error,
+    DB, KvComponent, component_data_path, component_index_path, db::EntityID,
+    entity_handler::EntityHandler, error::Error,
 };
 
 pub enum BoundCondition {
@@ -29,14 +30,19 @@ where
         }
     }
 
-    async fn query_entity_id(&self, snapshot: &mut tikv_client::Snapshot) -> Result<String, Error> {
+    async fn query_entity_id(
+        &self,
+        snapshot: &mut tikv_client::Snapshot,
+    ) -> Result<EntityID, Error> {
         let (start, end) = match &self.bound_condition {
             BoundCondition::Value(value) => (value, value),
             BoundCondition::Range(start, end) => (start, end),
         };
 
-        let start_key = component_index_path(T::type_path(), &self.field_name, start, "");
-        let end_key = component_index_path(T::type_path(), &self.field_name, end, "~");
+        let start_key =
+            component_index_path(T::type_path(), &self.field_name, start, &EntityID::Empty);
+        let end_key = component_index_path(T::type_path(), &self.field_name, end, &EntityID::Max);
+
         let Some(kv) = snapshot
             .scan(start_key..end_key.into(), 1)
             .await
@@ -45,8 +51,10 @@ where
         else {
             return Err(Error::NotFound);
         };
-        return Ok(String::from_utf8(kv.value().to_vec())
-            .map_err(|e| Error::InvalidEntityId(e.to_string()))?);
+        return Ok(EntityID::new_raw(
+            String::from_utf8(kv.value().to_vec())
+                .map_err(|e| Error::InvalidEntityId(e.to_string()))?,
+        ));
     }
 
     pub async fn entity(&self) -> Result<EntityHandler, Error> {

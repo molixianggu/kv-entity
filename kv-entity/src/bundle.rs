@@ -1,4 +1,4 @@
-use crate::{KvComponent, db::EntityHandler, error::Error, meta::EntityMetadata};
+use crate::{KvComponent, entity_handler::EntityHandler, error::Error, meta::EntityMetadata};
 use prost::Message;
 
 pub trait ComponentBundle: Sized {

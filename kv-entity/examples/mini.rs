@@ -1,6 +1,7 @@
 use futures::StreamExt;
 use kv_entity::DB;
 use kv_entity::Error;
+use kv_entity::RelationDirection;
 
 #[derive(kv_entity::KvComponent, Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct UserInfo {
@@ -22,8 +23,9 @@ pub struct UserExtend {
     pub extend: ::prost::alloc::string::String,
 }
 
-#[derive(kv_entity::KvRelation)]
-#[derive(kv_entity::KvComponent, Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(
+    kv_entity::KvRelation, kv_entity::KvComponent, Clone, PartialEq, Eq, Hash, ::prost::Message,
+)]
 pub struct FriendRelation {
     #[prost(int32, tag = "1")]
     pub favorability: i32,
@@ -38,9 +40,11 @@ async fn main() -> Result<(), Error> {
 
     let db = DB::new(vec!["172.20.8.107:2379".to_string()]).await?;
 
+    db.keys().await?;
+
     for i in 0..10 {
         let uid = uuid::Uuid::new_v4().to_string();
-        db.entity(&uid)
+        db.entity(uid)
             .attach(UserInfo {
                 name: "Bob".to_string(),
                 age: i,
@@ -52,11 +56,11 @@ async fn main() -> Result<(), Error> {
     let mut iterator = db.iterator::<UserInfo>();
     while let Some(Ok((entity_id, data))) = iterator.next().await {
         log::info!("entity_id = {:?}, data = {:?}", entity_id, data);
-        db.entity(&entity_id).delete().await?;
+        db.entity(entity_id).delete().await?;
     }
 
-    let uid = uuid::Uuid::new_v4().to_string();
-    db.entity(&uid)
+    let uid_a = uuid::Uuid::new_v4().to_string();
+    db.entity(uid_a.clone())
         .attach((
             UserInfo {
                 name: "Alice".to_string(),
@@ -68,7 +72,40 @@ async fn main() -> Result<(), Error> {
             },
         ))
         .await?;
-    log::info!("attach entity {} success", uid);
+    log::info!("attach entity {} success", uid_a);
+
+    let uid_b = uuid::Uuid::new_v4().to_string();
+    db.entity(uid_b.clone())
+        .attach((
+            UserInfo {
+                name: "Bob".to_string(),
+                age: 25,
+                email: "bob@example.com".to_string(),
+            },
+            UserExtend {
+                extend: "extend".to_string(),
+            },
+        ))
+        .await?;
+    log::info!("attach entity {} success", uid_b);
+
+    db.entity(uid_a.clone())
+        .link(uid_b.clone(), FriendRelation { favorability: 100 })
+        .await?;
+    log::info!("link entity {} to {} success", uid_a, uid_b);
+
+    let mut edges = db
+        .entity(uid_b.clone())
+        .edges::<FriendRelation>(RelationDirection::Both)
+        .await;
+    while let Some(Ok((entity_id, direction, value))) = edges.next().await {
+        log::info!(
+            "entity_id = {:?}, direction = {:?}, value = {:?}",
+            entity_id,
+            direction,
+            value
+        );
+    }
 
     let a = db.query::<UserInfo>().name("Alice").single().await?;
     log::info!("a = {:?}", a);
@@ -83,9 +120,12 @@ async fn main() -> Result<(), Error> {
         .unwrap();
     log::info!("b = {:?}", b);
 
-    db.entity(&uid).delete().await?;
+    db.entity(uid_a.clone()).delete().await?;
 
-    log::info!("delete entity {} success", uid);
+    log::info!("delete entity {} success", uid_a);
+
+    db.entity(uid_b.clone()).delete().await?;
+    log::info!("delete entity {} success", uid_b);
 
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 

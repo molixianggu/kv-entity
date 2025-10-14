@@ -14,12 +14,14 @@ pub fn derive_kv_components(input: TokenStream) -> TokenStream {
         Data::Struct(data_struct) => {
             match &data_struct.fields {
                 Fields::Named(fields) => {
-                    fields.named.iter()
+                    fields
+                        .named
+                        .iter()
                         .filter_map(|field| {
                             // 检查字段是否有 #[index] 属性
-                            let has_index = field.attrs.iter()
-                                .any(|attr| attr.path().is_ident("index"));
-                            
+                            let has_index =
+                                field.attrs.iter().any(|attr| attr.path().is_ident("index"));
+
                             if has_index {
                                 let field_name = field.ident.as_ref()?;
                                 let field_type = &field.ty;
@@ -36,17 +38,20 @@ pub fn derive_kv_components(input: TokenStream) -> TokenStream {
         _ => vec![],
     };
 
-    let indexed_field_names: Vec<_> = indexed_fields.iter().map(|(field_name, _)| {
-        let name_str = field_name.to_string();
-        quote! { #name_str }
-    }).collect();
+    let indexed_field_names: Vec<_> = indexed_fields
+        .iter()
+        .map(|(field_name, _)| {
+            let name_str = field_name.to_string();
+            quote! { #name_str }
+        })
+        .collect();
 
     // 为每个索引字段生成编码函数
     let encode_functions = indexed_fields.iter().map(|(field_name, field_type)| {
         let encode_fn_name = format_ident!("encode_{}", field_name);
         let is_string_type = quote!(#field_type).to_string().contains("String");
         let is_numeric_type = matches_numeric_type(field_type);
-        
+
         if is_string_type {
             quote! {
                 pub fn #encode_fn_name(value: impl Into<String>) -> String {
@@ -65,19 +70,15 @@ pub fn derive_kv_components(input: TokenStream) -> TokenStream {
             quote! {}
         }
     });
-    
+
     // 为每个索引字段生成查询方法
     let query_methods = indexed_fields.iter().map(|(field_name, field_type)| {
         let method_name = format_ident!("{}", field_name);
-        
         // 判断字段类型，生成不同的方法签名
         let is_string_type = quote!(#field_type).to_string().contains("String");
         let is_numeric_type = matches_numeric_type(field_type);
-        
         let encode_fn_name = format_ident!("encode_{}", field_name);
-        
         let field_name_str = field_name.to_string();
-        
         if is_string_type {
             quote! {
                 pub fn #method_name(&mut self, value: impl Into<String>) -> kv_entity::Filter<#struct_name> {
@@ -109,9 +110,7 @@ pub fn derive_kv_components(input: TokenStream) -> TokenStream {
             let field_name_str = field_name.to_string();
             let is_string_type = quote!(#field_type).to_string().contains("String");
             let is_numeric_type = matches_numeric_type(field_type);
-            
             let encode_fn_name = format_ident!("encode_{}", field_name);
-            
             if is_string_type {
                 quote! {
                     result.push((#field_name_str.to_string(), #struct_name::#encode_fn_name(self.#field_name.clone())));
@@ -124,7 +123,7 @@ pub fn derive_kv_components(input: TokenStream) -> TokenStream {
                 quote! {}
             }
         });
-        
+
         quote! {
             fn indexed_fields(&self) -> Vec<(String, String)> {
                 let mut result = Vec::new();
@@ -142,14 +141,14 @@ pub fn derive_kv_components(input: TokenStream) -> TokenStream {
         impl kv_entity::KvComponent for #struct_name {
             type Query = #query_struct_name;
 
-            fn type_path() -> &'static str {
-                concat!(module_path!(), "::", stringify!(#struct_name))
+            fn type_path() -> kv_entity::TypePath {
+                kv_entity::TypePath(concat!(module_path!(), "::", stringify!(#struct_name)))
             }
 
             fn query(client: kv_entity::DB) -> #query_struct_name {
                 #query_struct_name { client }
             }
-            
+
             #indexed_fields_impl
         }
 
@@ -176,16 +175,15 @@ pub fn derive_kv_components(input: TokenStream) -> TokenStream {
     TokenStream::from(expanded)
 }
 
-
 #[proc_macro_derive(KvRelation)]
 pub fn derive_kv_relation(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let struct_name = &input.ident;
-    
+
     let expanded = quote! {
         impl kv_entity::KvRelation for #struct_name {
-            fn type_path() -> &'static str {
-                concat!(module_path!(), "::", stringify!(#struct_name))
+            fn type_path() -> kv_entity::TypePath {
+                kv_entity::TypePath(concat!(module_path!(), "::", stringify!(#struct_name)))
             }
         }
     };
@@ -203,9 +201,9 @@ fn generate_numeric_encoding(type_str: &str) -> proc_macro2::TokenStream {
         "u64" => quote! { format!("{:020}", value) },
         "u128" => quote! { format!("{:039}", value) },
         "usize" => quote! { format!("{:020}", value) }, // 假设最大为 u64
-        
+
         // 有符号整数 - 偏移后零填充（让负数也能正确排序）
-        "i8" => quote! { 
+        "i8" => quote! {
             let offset_value = (value as i16 + 128) as u16;
             format!("{:03}", offset_value)
         },
@@ -231,7 +229,7 @@ fn generate_numeric_encoding(type_str: &str) -> proc_macro2::TokenStream {
             let offset_value = (value as i128 + 9223372036854775808) as u128;
             format!("{:020}", offset_value)
         },
-        
+
         // 浮点数 - 转换为可排序的二进制表示
         "f32" => quote! {
             let bits = value.to_bits();
@@ -253,7 +251,7 @@ fn generate_numeric_encoding(type_str: &str) -> proc_macro2::TokenStream {
             };
             format!("{:020}", sortable_bits)
         },
-        
+
         _ => quote! { format!("{:020}", value) }, // 默认处理
     }
 }
@@ -263,8 +261,18 @@ fn matches_numeric_type(ty: &Type) -> bool {
     let type_str = quote!(#ty).to_string();
     matches!(
         type_str.as_str(),
-        "i8" | "i16" | "i32" | "i64" | "i128" | "isize" |
-        "u8" | "u16" | "u32" | "u64" | "u128" | "usize" |
-        "f32" | "f64"
+        "i8" | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "isize"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "usize"
+            | "f32"
+            | "f64"
     )
 }
