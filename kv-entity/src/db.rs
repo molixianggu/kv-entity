@@ -3,7 +3,10 @@ use futures::Stream;
 use tikv_client::{Key, TransactionClient};
 
 use crate::{
-    KvComponent, component_data_path, entity_handler::EntityHandler, error::Error, next_key,
+    KvComponent, component_data_path,
+    entity_handler::{EntityHandler, EntityListHandler},
+    error::Error,
+    next_key,
     utils::key_to_string,
 };
 
@@ -38,7 +41,7 @@ impl DB {
         T::query(self.clone())
     }
 
-    pub fn iterator<T: KvComponent + prost::Message + Default + 'static>(
+    pub fn get<T: KvComponent + prost::Message + Default + 'static>(
         &self,
     ) -> std::pin::Pin<Box<dyn Stream<Item = Result<(EntityID, T), Error>> + '_>> {
         const PAGE_SIZE: usize = 128;
@@ -82,6 +85,54 @@ impl DB {
         })
     }
 
+    pub async fn get_entity<T: KvComponent + prost::Message + Default + 'static>(
+        &self,
+    ) -> Result<EntityListHandler, Error> {
+        const PAGE_SIZE: usize = 128;
+        let mut snapshot = self.client.snapshot(
+            self.client
+                .current_timestamp()
+                .await
+                .map_err(Error::TikvError)?,
+            tikv_client::TransactionOptions::new_optimistic(),
+        );
+
+        let mut start_key: Key = component_data_path(T::type_path(), &EntityID::Empty).into();
+        let end_key: Key = component_data_path(T::type_path(), &EntityID::Max).into();
+
+        let mut entity_ids = Vec::new();
+        loop {
+            let kvs = snapshot
+                .scan_keys(start_key.clone()..end_key.clone(), PAGE_SIZE as u32)
+                .await
+                .map_err(Error::TikvError)?
+                .collect::<Vec<_>>();
+            if kvs.is_empty() {
+                break;
+            }
+            start_key = next_key(&kvs.last().ok_or(Error::NotFound)?.clone());
+            let len = kvs.len();
+            for kv in kvs {
+                let key = key_to_string(&kv)?
+                    .split('/')
+                    .nth(3)
+                    .ok_or(Error::NotFound)?
+                    .to_string();
+                let Some(entity_id) = key.strip_prefix("e-") else {
+                    continue;
+                };
+                entity_ids.push(EntityID::new(entity_id.to_string()));
+            }
+            if len < PAGE_SIZE {
+                break;
+            }
+        }
+        Ok(EntityListHandler {
+            entity_ids,
+            client: self.client.clone(),
+        })
+    }
+
     pub async fn keys(&self) -> Result<(), Error> {
         const PAGE_SIZE: usize = 128;
         let mut tnx = self
@@ -119,7 +170,7 @@ impl DB {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub enum EntityID {
     Resource,
     Entity(String),

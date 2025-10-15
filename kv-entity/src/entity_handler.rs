@@ -48,7 +48,18 @@ impl EntityHandler {
     }
 
     pub async fn attach(&self, bundle: impl ComponentBundle) -> Result<Self, Error> {
-        bundle.attach_to(self).await
+        let mut txn = self
+            .client
+            .begin_optimistic()
+            .await
+            .map_err(Error::TikvError)?;
+        let mut mutations = Vec::new();
+        bundle.attach_to(self, &mut txn, &mut mutations).await?;
+        txn.batch_mutate(mutations)
+            .await
+            .map_err(Error::TikvError)?;
+        txn.commit().await.map_err(Error::TikvError)?;
+        Ok(self.clone())
     }
 
     pub async fn detach<T: KvComponent + prost::Message + Default>(&self) -> Result<Self, Error> {
@@ -99,61 +110,13 @@ impl EntityHandler {
             .await
             .map_err(Error::TikvError)?;
 
-        let Some(metadata) = self.get_metadata(&mut txn).await? else {
-            txn.rollback().await.map_err(Error::TikvError)?;
-            return Err(Error::NotFound);
-        };
         let mut mutations = Vec::new();
-        for (component_type, component_archetype) in metadata.component_archetypes.iter() {
-            let component_type = TypePath(intern_string(component_type.as_str()));
-            for (field, key) in component_archetype.index_keys.iter() {
-                mutations.push(kvrpcpb::Mutation {
-                    key: component_index_path(component_type, field, key, &self.entity_id).into(),
-                    op: kvrpcpb::Op::Del.into(),
-                    ..Default::default()
-                });
-            }
-            mutations.push(kvrpcpb::Mutation {
-                key: component_data_path(component_type, &self.entity_id).into(),
-                op: kvrpcpb::Op::Del.into(),
-                ..Default::default()
-            });
-        }
-        for (entity_id, direction, type_path) in self.scan_edges_all_in_txn(&mut txn).await? {
-            mutations.push(kvrpcpb::Mutation {
-                key: relation_edge_path(type_path, &self.entity_id, &entity_id, direction).into(),
-                op: kvrpcpb::Op::Del.into(),
-                ..Default::default()
-            });
-            mutations.push(kvrpcpb::Mutation {
-                key: relation_edge_path(type_path, &entity_id, &self.entity_id, !direction).into(),
-                op: kvrpcpb::Op::Del.into(),
-                ..Default::default()
-            });
-            match direction {
-                RelationDirection::In => {
-                    mutations.push(kvrpcpb::Mutation {
-                        key: relation_data_path(type_path, &self.entity_id, &entity_id).into(),
-                        op: kvrpcpb::Op::Del.into(),
-                        ..Default::default()
-                    });
-                }
-                RelationDirection::Out => {
-                    mutations.push(kvrpcpb::Mutation {
-                        key: relation_data_path(type_path, &entity_id, &self.entity_id).into(),
-                        op: kvrpcpb::Op::Del.into(),
-                        ..Default::default()
-                    });
-                }
-                RelationDirection::Both => {
-                    unreachable!();
-                }
-            }
-        }
+
+        self.delete_in_txn(&mut txn, &mut mutations).await?;
+
         txn.batch_mutate(mutations)
             .await
             .map_err(Error::TikvError)?;
-        self.delete_metadata(&mut txn).await?;
         txn.commit().await.map_err(Error::TikvError)?;
         Ok(self.clone())
     }
@@ -312,30 +275,41 @@ impl EntityHandler {
                 start_key = next_key(&kvs.last().ok_or(Error::NotFound)?.clone());
                 let len = kvs.len();
 
+                let mut data_keys = Vec::new();
+
                 for k in kvs {
                     let key = key_to_string(&k)?;
                     let a = EntityID::new_raw(key.split("/").nth(2).ok_or(Error::NotFound)?.to_string());
                     let b = EntityID::new_raw(key.split("/").nth(5).ok_or(Error::NotFound)?.to_string());
                     let direction = key.split("/").nth(4).ok_or(Error::NotFound)?.to_string();
 
-                    let (data_key, direction, entity_id) = match direction.as_str() {
-                        "in" => (
-                            relation_data_path(T::type_path(), &a, &b),
-                            RelationDirection::In,
-                            b,
-                        ),
-                        "out" => (
-                            relation_data_path(T::type_path(), &b, &a),
-                            RelationDirection::Out,
-                            a,
-                        ),
-                        _ => {
-                            log::error!("relation direction not found: {}", direction);
-                            unreachable!();
-                        }
+                    let data_key = match direction.as_str() {
+                        "in" => relation_data_path(T::type_path(), &a, &b),
+                        "out" => relation_data_path(T::type_path(), &b, &a),
+                        _ => unreachable!(),
                     };
-                    let data = snapshot.get(data_key.clone()).await.map_err(Error::TikvError)?.ok_or(Error::NotFound)?;
-                    let value = T::decode(data.as_slice()).map_err(Error::DeserializationError)?;
+                    data_keys.push(data_key);
+                }
+
+                let data_values = snapshot.batch_get(data_keys).await.map_err(Error::TikvError)?;
+
+                for data in data_values {
+                    let key = key_to_string(&data.key())?;
+                    let a = EntityID::new_raw(key.split("/").nth(3).ok_or(Error::NotFound)?.to_string());
+                    let b = EntityID::new_raw(key.split("/").nth(4).ok_or(Error::NotFound)?.to_string());
+
+                    let entity_id;
+                    let direction;
+
+                    if self_entity_id == a {
+                        direction = RelationDirection::In;
+                        entity_id = b.clone();
+                    } else {
+                        direction = RelationDirection::Out;
+                        entity_id = a.clone();
+                    }
+
+                    let value = T::decode(data.value().as_slice()).map_err(Error::DeserializationError)?;
                     yield (entity_id, direction, value);
                 }
                 if len < PAGE_SIZE {
@@ -358,56 +332,6 @@ impl EntityHandler {
             .edges_entity_in_txn(T::type_path(), direction, &mut txn)
             .await?;
         txn.commit().await.map_err(Error::TikvError)?;
-        Ok(edges)
-    }
-
-    async fn edges_entity_in_txn(
-        &self,
-        type_path: TypePath,
-        direction: RelationDirection,
-        txn: &mut tikv_client::Transaction,
-    ) -> Result<Vec<(EntityID, RelationDirection)>, Error> {
-        const PAGE_SIZE: usize = 128;
-        let mut start_key: Key =
-            relation_edge_path(type_path, &self.entity_id, &EntityID::Empty, direction).into();
-        let end_key: Key =
-            relation_edge_path(type_path, &self.entity_id, &EntityID::Max, direction).into();
-
-        let mut edges = Vec::new();
-        loop {
-            let kvs = txn
-                .scan_keys(start_key.clone()..end_key.clone(), PAGE_SIZE as u32)
-                .await
-                .map_err(Error::TikvError)?
-                .collect::<Vec<_>>();
-            if kvs.is_empty() {
-                break;
-            }
-            start_key = next_key(&kvs.last().ok_or(Error::NotFound)?.clone());
-            let len = kvs.len();
-
-            for k in kvs {
-                let key = key_to_string(&k)?;
-                let a =
-                    EntityID::new_raw(key.split("/").nth(2).ok_or(Error::NotFound)?.to_string());
-                let b =
-                    EntityID::new_raw(key.split("/").nth(5).ok_or(Error::NotFound)?.to_string());
-                let direction = key.split("/").nth(4).ok_or(Error::NotFound)?.to_string();
-
-                let (direction, entity_id) = match direction.as_str() {
-                    "in" => (RelationDirection::In, &b),
-                    "out" => (RelationDirection::Out, &a),
-                    _ => {
-                        log::error!("relation direction not found: {}", direction);
-                        unreachable!();
-                    }
-                };
-                edges.push((entity_id.clone(), direction));
-            }
-            if len < PAGE_SIZE {
-                break;
-            }
-        }
         Ok(edges)
     }
 
@@ -466,57 +390,9 @@ impl EntityHandler {
         txn.commit().await.map_err(Error::TikvError)?;
         Ok(self.clone())
     }
+}
 
-    async fn scan_edges_all_in_txn(
-        &self,
-        txn: &mut tikv_client::Transaction,
-    ) -> Result<Vec<(EntityID, RelationDirection, TypePath)>, Error> {
-        const PAGE_SIZE: usize = 128;
-        let mut start_key: Key = relation_edge_no_type_path(&self.entity_id, TypePath("")).into();
-        let end_key: Key = relation_edge_no_type_path(&self.entity_id, TypePath("~")).into();
-
-        let mut edges = Vec::new();
-        loop {
-            let kvs = txn
-                .scan_keys(start_key.clone()..end_key.clone(), PAGE_SIZE as u32)
-                .await
-                .map_err(Error::TikvError)?
-                .collect::<Vec<_>>();
-
-            if kvs.is_empty() {
-                break;
-            }
-            start_key = next_key(&kvs.last().ok_or(Error::NotFound)?.clone());
-            let len = kvs.len();
-
-            for k in kvs {
-                let key = key_to_string(&k)?;
-                let a = key.split("/").nth(2).ok_or(Error::NotFound)?.to_string();
-                let b = key.split("/").nth(5).ok_or(Error::NotFound)?.to_string();
-                let direction = key.split("/").nth(4).ok_or(Error::NotFound)?.to_string();
-                let type_path = key.split("/").nth(3).ok_or(Error::NotFound)?.to_string();
-
-                let (direction, entity_id) = match direction.as_str() {
-                    "in" => (RelationDirection::In, b),
-                    "out" => (RelationDirection::Out, a),
-                    _ => {
-                        log::error!("relation direction not found: {}", direction);
-                        unreachable!();
-                    }
-                };
-                edges.push((
-                    EntityID::new_raw(entity_id),
-                    direction,
-                    TypePath(intern_string(&type_path)),
-                ));
-            }
-            if len < PAGE_SIZE {
-                break;
-            }
-        }
-        Ok(edges)
-    }
-
+impl EntityHandler {
     pub(super) async fn get_metadata(
         &self,
         txn: &mut tikv_client::Transaction,
@@ -616,5 +492,248 @@ impl EntityHandler {
         });
 
         Ok(())
+    }
+
+    async fn edges_entity_in_txn(
+        &self,
+        type_path: TypePath,
+        direction: RelationDirection,
+        txn: &mut tikv_client::Transaction,
+    ) -> Result<Vec<(EntityID, RelationDirection)>, Error> {
+        const PAGE_SIZE: usize = 128;
+        let mut start_key: Key =
+            relation_edge_path(type_path, &self.entity_id, &EntityID::Empty, direction).into();
+        let end_key: Key =
+            relation_edge_path(type_path, &self.entity_id, &EntityID::Max, direction).into();
+
+        let mut edges = Vec::new();
+        loop {
+            let kvs = txn
+                .scan_keys(start_key.clone()..end_key.clone(), PAGE_SIZE as u32)
+                .await
+                .map_err(Error::TikvError)?
+                .collect::<Vec<_>>();
+            if kvs.is_empty() {
+                break;
+            }
+            start_key = next_key(&kvs.last().ok_or(Error::NotFound)?.clone());
+            let len = kvs.len();
+
+            for k in kvs {
+                let key = key_to_string(&k)?;
+                let a =
+                    EntityID::new_raw(key.split("/").nth(2).ok_or(Error::NotFound)?.to_string());
+                let b =
+                    EntityID::new_raw(key.split("/").nth(5).ok_or(Error::NotFound)?.to_string());
+                let direction = key.split("/").nth(4).ok_or(Error::NotFound)?.to_string();
+
+                let (direction, entity_id) = match direction.as_str() {
+                    "in" => (RelationDirection::In, &b),
+                    "out" => (RelationDirection::Out, &a),
+                    _ => {
+                        log::error!("relation direction not found: {}", direction);
+                        unreachable!();
+                    }
+                };
+                edges.push((entity_id.clone(), direction));
+            }
+            if len < PAGE_SIZE {
+                break;
+            }
+        }
+        Ok(edges)
+    }
+
+    async fn scan_edges_all_in_txn(
+        &self,
+        txn: &mut tikv_client::Transaction,
+    ) -> Result<Vec<(EntityID, RelationDirection, TypePath)>, Error> {
+        const PAGE_SIZE: usize = 128;
+        let mut start_key: Key = relation_edge_no_type_path(&self.entity_id, TypePath("")).into();
+        let end_key: Key = relation_edge_no_type_path(&self.entity_id, TypePath("~")).into();
+
+        let mut edges = Vec::new();
+        loop {
+            let kvs = txn
+                .scan_keys(start_key.clone()..end_key.clone(), PAGE_SIZE as u32)
+                .await
+                .map_err(Error::TikvError)?
+                .collect::<Vec<_>>();
+
+            if kvs.is_empty() {
+                break;
+            }
+            start_key = next_key(&kvs.last().ok_or(Error::NotFound)?.clone());
+            let len = kvs.len();
+
+            for k in kvs {
+                let key = key_to_string(&k)?;
+                let a = key.split("/").nth(2).ok_or(Error::NotFound)?.to_string();
+                let b = key.split("/").nth(5).ok_or(Error::NotFound)?.to_string();
+                let direction = key.split("/").nth(4).ok_or(Error::NotFound)?.to_string();
+                let type_path = key.split("/").nth(3).ok_or(Error::NotFound)?.to_string();
+
+                let (direction, entity_id) = match direction.as_str() {
+                    "in" => (RelationDirection::In, b),
+                    "out" => (RelationDirection::Out, a),
+                    _ => {
+                        log::error!("relation direction not found: {}", direction);
+                        unreachable!();
+                    }
+                };
+                edges.push((
+                    EntityID::new_raw(entity_id),
+                    direction,
+                    TypePath(intern_string(&type_path)),
+                ));
+            }
+            if len < PAGE_SIZE {
+                break;
+            }
+        }
+        Ok(edges)
+    }
+
+    async fn delete_in_txn(
+        &self,
+        mut txn: &mut tikv_client::Transaction,
+        mutations: &mut Vec<kvrpcpb::Mutation>,
+    ) -> Result<(), Error> {
+        let Some(metadata) = self.get_metadata(&mut txn).await? else {
+            txn.rollback().await.map_err(Error::TikvError)?;
+            return Err(Error::NotFound);
+        };
+        for (component_type, component_archetype) in metadata.component_archetypes.iter() {
+            let component_type = TypePath(intern_string(component_type.as_str()));
+            for (field, key) in component_archetype.index_keys.iter() {
+                mutations.push(kvrpcpb::Mutation {
+                    key: component_index_path(component_type, field, key, &self.entity_id).into(),
+                    op: kvrpcpb::Op::Del.into(),
+                    ..Default::default()
+                });
+            }
+            mutations.push(kvrpcpb::Mutation {
+                key: component_data_path(component_type, &self.entity_id).into(),
+                op: kvrpcpb::Op::Del.into(),
+                ..Default::default()
+            });
+        }
+        for (entity_id, direction, type_path) in self.scan_edges_all_in_txn(&mut txn).await? {
+            mutations.push(kvrpcpb::Mutation {
+                key: relation_edge_path(type_path, &self.entity_id, &entity_id, direction).into(),
+                op: kvrpcpb::Op::Del.into(),
+                ..Default::default()
+            });
+            mutations.push(kvrpcpb::Mutation {
+                key: relation_edge_path(type_path, &entity_id, &self.entity_id, !direction).into(),
+                op: kvrpcpb::Op::Del.into(),
+                ..Default::default()
+            });
+            match direction {
+                RelationDirection::In => {
+                    mutations.push(kvrpcpb::Mutation {
+                        key: relation_data_path(type_path, &self.entity_id, &entity_id).into(),
+                        op: kvrpcpb::Op::Del.into(),
+                        ..Default::default()
+                    });
+                }
+                RelationDirection::Out => {
+                    mutations.push(kvrpcpb::Mutation {
+                        key: relation_data_path(type_path, &entity_id, &self.entity_id).into(),
+                        op: kvrpcpb::Op::Del.into(),
+                        ..Default::default()
+                    });
+                }
+                RelationDirection::Both => {
+                    unreachable!();
+                }
+            }
+        }
+        self.delete_metadata(&mut txn).await?;
+
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub struct EntityListHandler {
+    pub(crate) entity_ids: Vec<EntityID>,
+    pub(crate) client: TransactionClient,
+}
+
+impl EntityListHandler {
+    pub fn new(entity_ids: Vec<EntityID>, client: TransactionClient) -> Self {
+        Self { entity_ids, client }
+    }
+
+    pub async fn attach(&self, bundle: impl ComponentBundle) -> Result<Self, Error> {
+        let mut txn = self
+            .client
+            .begin_optimistic()
+            .await
+            .map_err(Error::TikvError)?;
+        let mut mutations = Vec::new();
+        for entity_id in self.entity_ids.iter() {
+            bundle
+                .clone()
+                .attach_to(
+                    &EntityHandler {
+                        entity_id: entity_id.clone(),
+                        client: self.client.clone(),
+                    },
+                    &mut txn,
+                    &mut mutations,
+                )
+                .await?;
+        }
+        txn.batch_mutate(mutations)
+            .await
+            .map_err(Error::TikvError)?;
+        txn.commit().await.map_err(Error::TikvError)?;
+        Ok(self.clone())
+    }
+
+    pub async fn get<T: KvComponent + prost::Message + Default>(&self) -> Result<Vec<T>, Error> {
+        let mut snapshot = self.client.snapshot(
+            self.client
+                .current_timestamp()
+                .await
+                .map_err(Error::TikvError)?,
+            tikv_client::TransactionOptions::new_optimistic(),
+        );
+
+        snapshot
+            .batch_get(
+                self.entity_ids
+                    .iter()
+                    .map(|id| component_data_path(T::type_path(), id))
+                    .collect::<Vec<_>>(),
+            )
+            .await
+            .map_err(Error::TikvError)?
+            .map(|data| T::decode(data.value().as_slice()).map_err(Error::DeserializationError))
+            .collect()
+    }
+
+    pub async fn delete(&self) -> Result<Self, Error> {
+        let mut txn = self
+            .client
+            .begin_optimistic()
+            .await
+            .map_err(Error::TikvError)?;
+        let mut mutations = Vec::new();
+        for entity_id in self.entity_ids.iter() {
+            EntityHandler {
+                entity_id: entity_id.clone(),
+                client: self.client.clone(),
+            }
+            .delete_in_txn(&mut txn, &mut mutations)
+            .await?;
+        }
+        txn.batch_mutate(mutations)
+            .await
+            .map_err(Error::TikvError)?;
+        txn.commit().await.map_err(Error::TikvError)?;
+        Ok(self.clone())
     }
 }

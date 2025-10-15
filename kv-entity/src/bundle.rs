@@ -1,40 +1,42 @@
 use crate::{KvComponent, entity_handler::EntityHandler, error::Error, meta::EntityMetadata};
 use prost::Message;
+use tikv_client::proto::kvrpcpb;
 
 pub trait ComponentBundle: Sized {
     fn attach_to(
         self,
         entity: &EntityHandler,
-    ) -> impl std::future::Future<Output = Result<EntityHandler, Error>> + Send;
+        txn: &mut tikv_client::Transaction,
+        mutations: &mut Vec<kvrpcpb::Mutation>,
+    ) -> impl std::future::Future<Output = Result<(), Error>> + Send;
+
+    fn clone(&self) -> Self;
 }
 
 impl<T> ComponentBundle for T
 where
-    T: KvComponent + Message + Default,
+    T: KvComponent + Message + Default + Clone,
 {
-    async fn attach_to(self, entity: &EntityHandler) -> Result<EntityHandler, Error> {
-        let mut txn = entity
-            .client
-            .begin_optimistic()
-            .await
-            .map_err(Error::TikvError)?;
-
+    async fn attach_to(
+        self,
+        entity: &EntityHandler,
+        txn: &mut tikv_client::Transaction,
+        mutations: &mut Vec<kvrpcpb::Mutation>,
+    ) -> Result<(), Error> {
         let mut metadata = entity
-            .get_metadata(&mut txn)
+            .get_metadata(txn)
             .await?
             .unwrap_or(EntityMetadata::default());
-        let mut mutations = Vec::new();
         entity
-            .attach_component_in_txn(&mut mutations, &mut metadata, self)
+            .attach_component_in_txn(mutations, &mut metadata, self)
             .await?;
-        if !mutations.is_empty() {
-            txn.batch_mutate(mutations)
-                .await
-                .map_err(Error::TikvError)?;
-        }
-        entity.update_metadata(&mut txn, metadata).await?;
-        txn.commit().await.map_err(Error::TikvError)?;
-        Ok(entity.clone())
+
+        entity.update_metadata(txn, metadata).await?;
+        Ok(())
+    }
+
+    fn clone(&self) -> Self {
+        Clone::clone(self)
     }
 }
 
@@ -42,36 +44,25 @@ macro_rules! impl_component_bundle_for_tuple {
     ($($T:ident),+) => {
         impl<$($T),+> ComponentBundle for ($($T,)+)
         where
-            $($T: KvComponent + Message + Default,)+
+            $($T: KvComponent + Message + Default + Clone, )+
         {
-            async fn attach_to(self, entity: &EntityHandler) -> Result<EntityHandler, Error> {
-                let mut txn = entity
-                    .client
-                    .begin_optimistic()
-                    .await
-                    .map_err(Error::TikvError)?;
-
-
+            async fn attach_to(self, entity: &EntityHandler, txn: &mut tikv_client::Transaction, mutations: &mut Vec<kvrpcpb::Mutation>) -> Result<(), Error> {
                 let mut metadata = entity
-                    .get_metadata(&mut txn)
+                    .get_metadata(txn)
                     .await?
                     .unwrap_or(EntityMetadata::default());
-                let mut mutations = Vec::new();
 
                 #[allow(non_snake_case)]
                 let ($($T,)+) = self;
                 $(
-                    entity.attach_component_in_txn(&mut mutations, &mut metadata, $T).await?;
+                    entity.attach_component_in_txn(mutations, &mut metadata, $T).await?;
                 )+
 
-                if !mutations.is_empty() {
-                    txn.batch_mutate(mutations)
-                        .await
-                        .map_err(Error::TikvError)?;
-                }
-                entity.update_metadata(&mut txn, metadata).await?;
-                txn.commit().await.map_err(Error::TikvError)?;
-                Ok(entity.clone())
+                entity.update_metadata(txn, metadata).await?;
+                Ok(())
+            }
+            fn clone(&self) -> Self {
+                Clone::clone(self)
             }
         }
     };

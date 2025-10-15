@@ -1,4 +1,5 @@
 use futures::StreamExt;
+use futures::TryStreamExt;
 use kv_entity::DB;
 use kv_entity::Error;
 use kv_entity::RelationDirection;
@@ -53,11 +54,13 @@ async fn main() -> Result<(), Error> {
             .await?;
     }
 
-    let mut iterator = db.iterator::<UserInfo>();
-    while let Some(Ok((entity_id, data))) = iterator.next().await {
+    // get all user info data iterator
+    for (entity_id, data) in db.get::<UserInfo>().try_collect::<Vec<_>>().await? {
         log::info!("entity_id = {:?}, data = {:?}", entity_id, data);
-        db.entity(entity_id).delete().await?;
     }
+
+    // get all user info entities and delete them
+    db.get_entity::<UserInfo>().await?.delete().await?;
 
     let uid_a = uuid::Uuid::new_v4().to_string();
     db.entity(uid_a.clone())
@@ -94,18 +97,26 @@ async fn main() -> Result<(), Error> {
         .await?;
     log::info!("link entity {} to {} success", uid_a, uid_b);
 
-    let mut edges = db
+    let edges = db
         .entity(uid_b.clone())
-        .edges::<FriendRelation>(RelationDirection::Both)
-        .await;
-    while let Some(Ok((entity_id, direction, value))) = edges.next().await {
-        log::info!(
-            "entity_id = {:?}, direction = {:?}, value = {:?}",
-            entity_id,
-            direction,
-            value
-        );
-    }
+        .edges::<FriendRelation>(RelationDirection::In)
+        .await
+        .try_collect::<Vec<_>>()
+        .await?;
+    log::info!("edges = {:?}", edges);
+    // or use stream
+    // let mut edges = db
+    //     .entity(uid_b.clone())
+    //     .edges::<FriendRelation>(RelationDirection::In)
+    //     .await;
+    // while let Some(Ok((entity_id, direction, value))) = edges.next().await {
+    //     log::info!(
+    //         "entity_id = {:?}, direction = {:?}, value = {:?}",
+    //         entity_id,
+    //         direction,
+    //         value
+    //     );
+    // }
 
     let a = db.query::<UserInfo>().name("Alice").single().await?;
     log::info!("a = {:?}", a);
