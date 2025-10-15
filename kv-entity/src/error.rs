@@ -10,6 +10,8 @@ pub enum Error {
     InvalidEntityId(String),
     #[error("Invalid utf8: {0}")]
     InvalidUtf8(std::string::FromUtf8Error),
+    #[error("Invalid u64: {0}")]
+    InvalidU64(std::num::ParseIntError),
     #[error("Not found")]
     NotFound,
 }
