@@ -279,13 +279,12 @@ impl EntityHandler {
 
                 for k in kvs {
                     let key = key_to_string(&k)?;
-                    let a = EntityID::new_raw(key.split("/").nth(2).ok_or(Error::NotFound)?.to_string());
-                    let b = EntityID::new_raw(key.split("/").nth(5).ok_or(Error::NotFound)?.to_string());
+                    let entity_id = EntityID::new_raw(key.split("/").nth(5).ok_or(Error::NotFound)?.to_string());
                     let direction = key.split("/").nth(4).ok_or(Error::NotFound)?.to_string();
 
                     let data_key = match direction.as_str() {
-                        "in" => relation_data_path(T::type_path(), &a, &b),
-                        "out" => relation_data_path(T::type_path(), &b, &a),
+                        "in" => relation_data_path(T::type_path(), &self_entity_id, &entity_id),
+                        "out" => relation_data_path(T::type_path(), &entity_id, &self_entity_id),
                         _ => unreachable!(),
                     };
                     data_keys.push(data_key);
@@ -521,19 +520,13 @@ impl EntityHandler {
 
             for k in kvs {
                 let key = key_to_string(&k)?;
-                let a =
-                    EntityID::new_raw(key.split("/").nth(2).ok_or(Error::NotFound)?.to_string());
-                let b =
+                let entity_id =
                     EntityID::new_raw(key.split("/").nth(5).ok_or(Error::NotFound)?.to_string());
-                let direction = key.split("/").nth(4).ok_or(Error::NotFound)?.to_string();
 
-                let (direction, entity_id) = match direction.as_str() {
-                    "in" => (RelationDirection::In, &b),
-                    "out" => (RelationDirection::Out, &a),
-                    _ => {
-                        log::error!("relation direction not found: {}", direction);
-                        unreachable!();
-                    }
+                let direction = match key.split("/").nth(4).ok_or(Error::NotFound)? {
+                    "in" => RelationDirection::In,
+                    "out" => RelationDirection::Out,
+                    _ => unreachable!(),
                 };
                 edges.push((entity_id.clone(), direction));
             }
@@ -568,24 +561,17 @@ impl EntityHandler {
 
             for k in kvs {
                 let key = key_to_string(&k)?;
-                let a = key.split("/").nth(2).ok_or(Error::NotFound)?.to_string();
-                let b = key.split("/").nth(5).ok_or(Error::NotFound)?.to_string();
-                let direction = key.split("/").nth(4).ok_or(Error::NotFound)?.to_string();
-                let type_path = key.split("/").nth(3).ok_or(Error::NotFound)?.to_string();
+                let entity_id =
+                    EntityID::new_raw(key.split("/").nth(5).ok_or(Error::NotFound)?.to_string());
+                let type_path =
+                    TypePath(intern_string(key.split("/").nth(3).ok_or(Error::NotFound)?));
 
-                let (direction, entity_id) = match direction.as_str() {
-                    "in" => (RelationDirection::In, b),
-                    "out" => (RelationDirection::Out, a),
-                    _ => {
-                        log::error!("relation direction not found: {}", direction);
-                        unreachable!();
-                    }
+                let direction = match key.split("/").nth(4).ok_or(Error::NotFound)? {
+                    "in" => RelationDirection::In,
+                    "out" => RelationDirection::Out,
+                    _ => unreachable!(),
                 };
-                edges.push((
-                    EntityID::new_raw(entity_id),
-                    direction,
-                    TypePath(intern_string(&type_path)),
-                ));
+                edges.push((entity_id, direction, type_path));
             }
             if len < PAGE_SIZE {
                 break;

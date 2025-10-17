@@ -1002,7 +1002,7 @@ dependencies = [
 
 [[package]]
 name = "kv-entity"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "async-stream",
  "env_logger",
@@ -1020,7 +1020,7 @@ dependencies = [
 
 [[package]]
 name = "kv-entity-derive"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "proc-macro2",
  "quote",
