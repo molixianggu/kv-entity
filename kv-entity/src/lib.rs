@@ -6,7 +6,7 @@ mod filter;
 mod meta;
 mod utils;
 
-pub use db::DB;
+pub use db::{DB, EntityID};
 pub use entity_handler::EntityHandler;
 pub use error::Error;
 pub use filter::{BoundCondition, Filter};
