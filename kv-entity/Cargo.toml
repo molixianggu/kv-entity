@@ -21,3 +21,6 @@ tokio = { version = "1", features = ["full"] }
 
 [build-dependencies]
 prost-build = "0.14.1"
+
+[patch.crates-io]
+tonic = "0.14.2"
