@@ -7,7 +7,7 @@ use crate::{
     entity_handler::{EntityHandler, EntityListHandler},
     error::Error,
     next_key,
-    utils::key_to_string,
+    utils::{component_increment_id_path, key_to_string},
 };
 
 #[derive(Clone)]
@@ -167,6 +167,43 @@ impl DB {
         }
         tnx.commit().await.map_err(Error::TikvError)?;
         Ok(())
+    }
+
+    pub async fn entity_increment<T: KvComponent + prost::Message + Default + Clone>(
+        &self,
+        value: T,
+    ) -> Result<EntityHandler, Error> {
+        let data_key = component_increment_id_path(T::type_path());
+
+        let mut txn = self
+            .client
+            .begin_pessimistic()
+            .await
+            .map_err(Error::TikvError)?;
+        let id = match txn
+            .get_for_update(data_key.clone())
+            .await
+            .map_err(Error::TikvError)?
+        {
+            Some(id) => {
+                let id = String::from_utf8(id.as_slice().to_vec()).map_err(Error::InvalidUtf8)?;
+                id.parse::<u64>().map_err(Error::InvalidU64)?
+            }
+            None => 0,
+        };
+
+        txn.put(data_key, format!("{:032x}", id + 1))
+            .await
+            .map_err(Error::TikvError)?;
+        txn.commit().await.map_err(Error::TikvError)?;
+
+        let entity_handler = EntityHandler {
+            entity_id: EntityID::new(format!("{:032x}", id)),
+            client: self.client.clone(),
+        };
+
+        entity_handler.attach(value).await?;
+        Ok(entity_handler)
     }
 }
 

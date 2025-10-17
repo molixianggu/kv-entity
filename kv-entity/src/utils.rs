@@ -77,6 +77,10 @@ pub(crate) fn relation_edge_no_type_path(entity_id: &EntityID, type_path: TypePa
     format!("relation/edge/{:?}/{}", entity_id, type_path.0)
 }
 
+pub(crate) fn component_increment_id_path(type_path: TypePath) -> String {
+    format!("component/increment_id/{}", type_path.0)
+}
+
 // 定义组件元信息
 pub struct ComponentMeta {
     pub type_path: &'static str,
